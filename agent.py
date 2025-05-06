@@ -206,6 +206,8 @@ commentor_agent = FunctionAgent(
             - Are new endpoints documented? - use the diff to determine this. \n 
             - Which lines could be improved upon? Quote these lines and offer suggestions the author could implement. \n
          - If you need any additional details, you must hand off to the Commentor Agent. \n
+         - You should directly address the author. So your comments should sound like: \n
+         "Thanks for fixing this. I think all places where we call quote should be fixed. Can you roll this fix out everywhere?"
     """,
 
     can_handoff_to=["ContextAgent", "ReviewAndPostingAgent"]
