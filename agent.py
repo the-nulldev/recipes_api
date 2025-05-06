@@ -1,0 +1,271 @@
+# write your code here
+
+import asyncio
+import os
+
+import dotenv
+from github import Github, GithubException
+from llama_index.core.agent.workflow import AgentOutput, ToolCallResult, ToolCall, AgentWorkflow, FunctionAgent
+from llama_index.core.prompts import RichPromptTemplate
+from llama_index.core.tools import FunctionTool
+from llama_index.core.workflow import Context
+from llama_index.llms.openai import OpenAI
+
+dotenv.load_dotenv()
+
+llm = OpenAI(
+    model="gpt-4o-mini",
+    api_key=os.getenv("OPENAI_API_KEY"),
+    api_base=os.getenv("OPENAI_BASE_URL"),
+)
+
+git = Github(os.getenv("GITHUB_TOKEN")) if os.getenv("GITHUB_TOKEN") else None
+
+# repo_url = os.getenv("REPOSITORY")
+# repo_name = repo_url.split('/')[-1].replace('.git', '')
+# username = repo_url.split('/')[-2]
+repository = os.getenv("REPOSITORY")
+if git is None:
+    raise ValueError("GitHub token is not set.")
+if git is not None:
+    repo = git.get_repo(repository)
+pr_number = os.getenv("PR_NUMBER")
+
+
+
+def get_pull_request_details(pr_number: int) -> dict:
+    """
+    Use this function to get details about a pull request such as user, title, body, diff url, state, and head sha
+
+    :param pr_number
+    """
+
+    if git is None:
+        raise ValueError("GitHub token is not set.")
+    try:
+        pr_details = {}
+
+        pull_request = repo.get_pull(pr_number)
+        if pull_request is None:
+            raise ValueError("The specified PR was not found.")
+
+        if pull_request is not None:
+            pr_details['user'] = pull_request.user.login
+            pr_details['title'] = pull_request.title
+            pr_details['body'] = pull_request.body
+            pr_details['state'] = pull_request.state
+            pr_details['diff_url'] = pull_request.diff_url
+            pr_details['head_sha'] = pull_request.head.sha
+        return pr_details
+
+    except GithubException as e:
+        if e.status == 404:
+            raise ValueError("The repository does not exist or is private.")
+        else:
+            raise ValueError(
+                f"An error occurred while accessing the repository: {e.data.get('message', 'No error message')}")
+
+
+def get_file_content(file_path: str) -> str:
+    """
+    Use this function to retrieve the content of a file in the repository given the file path.
+    """
+    if git is None:
+        raise ValueError("GitHub token is not set.")
+    try:
+        file_content = repo.get_contents(file_path).decoded_content.decode('utf-8')
+        return file_content
+
+    except GithubException as e:
+        if e.status == 404:
+            raise ValueError(f"The file {file_path} does not exist.")
+        else:
+            raise ValueError(
+                f"An error occurred while accessing the repository: {e.data.get('message', 'No error message')}")
+
+
+def get_changed_files(head_sha: str) -> list[dict[str, any]]:
+    """
+    Retrieves details about files changed in the specified commit.
+
+    Args:
+        head_sha (str): The commit SHA to inspect.
+
+    Returns:
+        list[dict[str, any]]: A list of file change details including:
+            - filename
+            - status
+            - additions
+            - deletions
+            - changes
+            - patch (diff)
+    Raises:
+        ValueError: If GitHub client isn't initialized or commit isn't found.
+    """
+    if git is None or repo is None:
+        raise ValueError("GitHub token is not set or repo is not initialized.")
+    try:
+        commit = repo.get_commit(head_sha)
+        changed_files: list[dict[str, any]] = []
+        for f in commit.files:
+            changed_files.append({
+                "filename": f.filename,
+                "status": f.status,
+                "additions": f.additions,
+                "deletions": f.deletions,
+                "changes": f.changes,
+                "patch": f.patch,
+            })
+        return changed_files
+    except GithubException as e:
+        if e.status == 404:
+            raise ValueError(f"Commit {head_sha} not found.")
+        raise ValueError(
+            f"An error occurred while fetching commit {head_sha}: {e.data.get('message', 'No error message')}")
+
+
+def post_review_comment_to_github(comment: str, pr_number: int, event: str):
+    """Posts the final pull request review to GitHub via the GitHub API"""
+    pull_request = repo.get_pull(pr_number)
+
+    pull_request.create_review(
+        body=comment,
+    )
+
+
+async def add_context_to_state(ctx: Context, gathered_contexts: str) -> str:
+    """Useful for adding the gathered contexts to the state."""
+    current_state = await ctx.get("state")
+    current_state["gathered_contexts"] = gathered_contexts
+    await ctx.set("state", current_state)
+    return "State updated with report contexts. "
+
+
+async def add_draft_comment_to_state(ctx: Context, draft_comment: str) -> str:
+    """
+    Useful for recording the review comment generated by commentor agent to state
+    """
+    current_state = await ctx.get("state")
+    current_state["review_comment"] = draft_comment
+    await ctx.set("state", current_state)
+    return "Comment added to state. "
+
+
+async def add_final_comment_to_state(ctx: Context, final_review_comment: str) -> str:
+    """Useful for adding the final reviewed comment to the state."""
+    current_state = await ctx.get("state")
+    current_state["final_review_comment"] = final_review_comment
+    await ctx.set("state", current_state)
+    return "Final comment successfully added to state. "
+
+
+pr_details_tool = FunctionTool.from_defaults(
+    get_pull_request_details,
+)
+
+file_content_tool = FunctionTool.from_defaults(
+    get_file_content,
+)
+
+changed_files_tool = FunctionTool.from_defaults(
+    get_changed_files,
+)
+
+posting_tool = FunctionTool.from_defaults(
+    post_review_comment_to_github,
+)
+
+context_agent = FunctionAgent(
+    llm=llm,
+    name="ContextAgent",
+    description="Gathers needed context from a repository such as PR details, changed files, file contents, and commit details. ",
+    tools=[pr_details_tool, file_content_tool, changed_files_tool, add_context_to_state],
+    system_prompt=f"""
+                        You are the context gathering agent. When gathering context, you MUST gather \n: 
+                            - The details: author, title, body, diff_url, state, and head_sha; \n
+                            - Changed files; \n
+                            - Any requested for files; \n
+                        Once you gather the requested info, you MUST hand control back to the Commentor Agent. 
+                    """,
+    can_handoff_to=["CommentorAgent"]
+)
+
+commentor_agent = FunctionAgent(
+    llm=llm,
+    name="CommentorAgent",
+    description="Uses the context gathered by the context agent to draft a pull review comment.",
+    tools=[add_draft_comment_to_state],
+    system_prompt="""
+        You are the commentor agent that writes review comments for pull requests as a human reviewer would. \n 
+        Ensure to do the following for a thorough review: 
+         - Request for the PR details, changed files, and any other repo files you may need from the ContextAgent. 
+         - Once you have asked for all the needed information, write a good ~200-300 word review in markdown format detailing: \n
+            - What is good about the PR? \n
+            - Did the author follow ALL contribution rules? What is missing? \n
+            - Are there tests for new functionality? If there are new models, are there migrations for them? - use the diff to determine this. \n
+            - Are new endpoints documented? - use the diff to determine this. \n 
+            - Which lines could be improved upon? Quote these lines and offer suggestions the author could implement. \n
+         - If you need any additional details, you must hand off to the Commentor Agent. \n
+    """,
+
+    can_handoff_to=["ContextAgent", "ReviewAndPostingAgent"]
+)
+
+review_and_poster_agent = FunctionAgent(
+    llm=llm,
+    name="ReviewAndPostingAgent",
+    description="Reviews the generated comment, requests edits if necessary, and posts the final comment to GitHub",
+    tools=[posting_tool, add_final_comment_to_state],
+    system_prompt="""
+        You are the Review and Posting agent. You must use the CommentorAgent to create a review comment. 
+        Once a review is generated, you need to run a final check and post it to GitHub.
+             - The review must: \n
+             - Be a ~200-300 word review in markdown format. \n
+             - Specify what is good about the PR: \n
+             - Did the author follow ALL contribution rules? What is missing? \n
+             - Are there notes on test availability for new functionality? If there are new models, are there migrations for them? \n
+             - Are there notes on whether new endpoints were documented? \n
+             - Are there suggestions on which lines could be improved upon? Are these lines quoted? \n
+         If the review does not meet this criteria, you must ask the CommentorAgent to rewrite and address these concerns. \n
+         When you are satisfied, post the review to GitHub.  
+    """,
+
+    can_handoff_to=["CommentorAgent"]
+)
+
+workflow_agent = AgentWorkflow(
+    agents=[context_agent, commentor_agent, review_and_poster_agent],
+    root_agent=review_and_poster_agent.name,
+    initial_state={
+        "gathered_contexts": "",
+        "draft_comment": "",
+        "fina_response": ""
+    },
+)
+
+
+async def main():
+    query = "Write a review for PR: " + pr_number
+    prompt = RichPromptTemplate(query)
+
+    handler = workflow_agent.run(prompt.format())
+
+    current_agent = None
+    async for event in handler.stream_events():
+        if hasattr(event, "current_agent_name") and event.current_agent_name != current_agent:
+            current_agent = event.current_agent_name
+            print(f"Current agent: {current_agent}")
+        elif isinstance(event, AgentOutput):
+            if event.response.content:
+                print("\\n\\nFinal response:", event.response.content)
+            if event.tool_calls:
+                print("Selected tools: ", [call.tool_name for call in event.tool_calls])
+        elif isinstance(event, ToolCallResult):
+            print(f"Output from tool: {event.tool_output}")
+        elif isinstance(event, ToolCall):
+            print(f"Calling selected tool: {event.tool_name}, with arguments: {event.tool_kwargs}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    git.close()
